@@ -459,7 +459,6 @@ def shuffle_sync_op(
                 T.i32(), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
             )
             i32_res = nvvm.shfl_sync(
-                T.i32(),
                 Int32(mask).ir_value(loc=loc, ip=ip),
                 i32_val,
                 Int32(offset).ir_value(loc=loc, ip=ip),
@@ -491,7 +490,6 @@ def shuffle_sync_op(
                 value = value.to(Uint32)
         return orig_type(
             nvvm.shfl_sync(
-                type(value).mlir_type,
                 Int32(mask).ir_value(loc=loc, ip=ip),
                 value.ir_value(loc=loc, ip=ip),
                 Int32(offset).ir_value(loc=loc, ip=ip),
@@ -504,7 +502,6 @@ def shuffle_sync_op(
     elif value.width == 32:  # type: ignore[attr-defined]
         return orig_type(
             nvvm.shfl_sync(
-                type(value).mlir_type,
                 Int32(mask).ir_value(loc=loc, ip=ip),
                 value.ir_value(loc=loc, ip=ip),
                 Int32(offset).ir_value(loc=loc, ip=ip),
@@ -531,7 +528,6 @@ def shuffle_sync_op(
         high_32_bits = arith.trunci(T.i32(), high_32_bits, loc=loc, ip=ip)
 
         low_32_bits_shfl = nvvm.shfl_sync(
-            T.i32(),
             Int32(mask).ir_value(loc=loc, ip=ip),
             low_32_bits,
             Int32(offset).ir_value(loc=loc, ip=ip),
@@ -541,7 +537,6 @@ def shuffle_sync_op(
             ip=ip,
         )
         high_32_bits_shfl = nvvm.shfl_sync(
-            T.i32(),
             Int32(mask).ir_value(loc=loc, ip=ip),
             high_32_bits,
             Int32(offset).ir_value(loc=loc, ip=ip),
@@ -954,7 +949,6 @@ def vote_sync_op(
 
     return return_type(
         nvvm.vote_sync(
-            T.i32() if kind == "ballot" else T.bool(),
             Int32(mask).ir_value(loc=loc, ip=ip),
             Boolean(pred).ir_value(loc=loc, ip=ip),
             VoteSyncKind.from_str(kind),
@@ -1992,6 +1986,100 @@ def cvt_i4x8_to_bf16x8(
     vec_bf16x8_type = ir.VectorType.get([8], BFloat16.mlir_type, loc=loc)
     vec_bf16x8 = llvm.bitcast(vec_bf16x8_type, rst_i32, loc=loc, ip=ip)
     return vec_bf16x8
+
+
+@dsl_user_op
+def cvt_i4x8_to_mxf8x8_impl(
+    src_i32: ir.Value,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
+    """Convert eight packed int4 values to two int32 words of FP8 bytes.
+
+    ``src_i32`` holds eight signed int4 values, one nibble per element. The
+    inline PTX uses ``prmt.b32`` with positive and negative E4M3 lookup tables
+    to produce the raw FP8 byte encodings in two 32-bit words.
+
+    :param src_i32: Packed int4 source value containing eight 4-bit elements.
+    :type src_i32: i32
+    :return: Vector of two i32 values, each containing four packed FP8 bytes.
+    :rtype: vector<2xi32>
+    """
+    sign_mask = arith.constant(Int32.mlir_type, 0x88888888, loc=loc, ip=ip)
+    lut_idx_mask = arith.constant(Int32.mlir_type, 0x77777777, loc=loc, ip=ip)
+    final_prmt_base = arith.constant(Int32.mlir_type, 0x32103210, loc=loc, ip=ip)
+    one = arith.constant(Int32.mlir_type, 1, loc=loc, ip=ip)
+    sixteen = arith.constant(Int32.mlir_type, 16, loc=loc, ip=ip)
+
+    pos_e4m3s_reg1 = arith.constant(Int32.mlir_type, 0x44403800, loc=loc, ip=ip)
+    pos_e4m3s_reg2 = arith.constant(Int32.mlir_type, 0x4E4C4A48, loc=loc, ip=ip)
+    neg_e4m3s_reg1 = arith.constant(Int32.mlir_type, 0xCACCCED0, loc=loc, ip=ip)
+    neg_e4m3s_reg2 = arith.constant(Int32.mlir_type, 0xB8C0C4C8, loc=loc, ip=ip)
+
+    sign = arith.andi(src_i32, sign_mask, loc=loc, ip=ip)
+    sign = arith.shrui(sign, one, loc=loc, ip=ip)
+
+    lut_idx = arith.andi(src_i32, lut_idx_mask, loc=loc, ip=ip)
+
+    rsts = []
+    for _ in range(2):
+        final_prmt_idx = arith.ori(sign, final_prmt_base, loc=loc, ip=ip)
+        rst = llvm.inline_asm(
+            Int32.mlir_type,
+            [
+                pos_e4m3s_reg1,
+                pos_e4m3s_reg2,
+                neg_e4m3s_reg1,
+                neg_e4m3s_reg2,
+                lut_idx,
+                final_prmt_idx,
+            ],
+            """{\n\t
+            .reg .b32 pos_f8s, neg_f8s;\n\t
+            prmt.b32 pos_f8s, $1, $2, $5;\n\t
+            prmt.b32 neg_f8s, $3, $4, $5;\n\t
+            prmt.b32 $0, pos_f8s, neg_f8s, $6;\n\t
+            }""",
+            "=r,n,n,n,n,r,r",
+        )
+        rsts.append(rst)
+
+        sign = arith.shrui(sign, sixteen, loc=loc, ip=ip)
+        lut_idx = arith.shrui(lut_idx, sixteen, loc=loc, ip=ip)
+
+    vec_type = ir.VectorType.get([2], Int32.mlir_type, loc=loc)
+    return vector.from_elements(vec_type, rsts, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cvt_i4x8_to_mxf8x8(
+    src_vec8: ir.Value,
+    *,
+    dst_type: ir.Type,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> ir.Value:
+    """Convert eight int4 values to FP8 operand bytes for MXF8 MMA.
+
+    The output values are generated as raw bytes by
+    :func:`cvt_i4x8_to_mxf8x8_impl`, then bitcast to ``vector<8 x dst_type>``.
+    Callers normally pass ``Int8.mlir_type`` and treat the result as raw bytes;
+    higher-level helpers may bitcast those bytes to an FP8 vector afterward.
+    This keeps the conversion instruction sequence small and avoids building
+    intermediate FP8 constants directly.
+
+    :param src_vec8: Source vector with eight int4 elements.
+    :type src_vec8: vector<8xi4>
+    :param dst_type: MLIR element type for the output bytes, usually ``Int8.mlir_type``.
+    :type dst_type: ir.Type
+    :return: Vector with eight FP8 elements.
+    :rtype: vector<8 x dst_type>
+    """
+    src_i32 = llvm.bitcast(Int32.mlir_type, src_vec8, loc=loc, ip=ip)
+    rst_i32x2 = cvt_i4x8_to_mxf8x8_impl(src_i32, loc=loc, ip=ip)
+    vec_mxf8x8_type = ir.VectorType.get([8], dst_type, loc=loc)
+    return llvm.bitcast(vec_mxf8x8_type, rst_i32x2, loc=loc, ip=ip)
 
 
 # Sign extend 4 int4 unpacked in 8b containers
@@ -3369,7 +3457,6 @@ def match_sync(
 
     if kind_enum == nvvm.MatchSyncKind.all:
         result = nvvm.match_sync(
-            llvm.StructType.get_literal([T.i32(), Boolean.mlir_type]),
             mask_ir,
             value_ir,
             kind_enum,
@@ -3379,7 +3466,6 @@ def match_sync(
         return Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip))
     else:
         result = nvvm.match_sync(
-            T.i32(),
             mask_ir,
             value_ir,
             kind_enum,

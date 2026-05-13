@@ -173,6 +173,7 @@ __all__ = [
     "prmt",
     "cvt_i8_bf16_intrinsic",
     "cvt_i4_bf16_intrinsic",
+    "cvt_i4_mxf8_intrinsic",
     "cvt_f4e2m1_f16_intrinsic",
     "cvt_i8x4_to_f32x4",
     "cvt_i8x2_to_f32x2",
