@@ -49,10 +49,6 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, "../../../.."))
 
-from cute.blackwell.kernel.mixed_input_gemm.mixed_input_host_utils import (
-    create_tensors_for_contiguous_grouped_mixed_input_gemm as create_tensors,
-    run_contiguous_grouped_ref_and_compare as run_ref_and_compare,
-)
 from cutlass.cute.runtime import from_dlpack
 
 """
@@ -2245,6 +2241,10 @@ def run(
     """
     m, n, k, l = mnkl
     import torch
+    from cute.blackwell.kernel.mixed_input_gemm.mixed_input_host_utils import (
+        create_tensors_for_contiguous_grouped_mixed_input_gemm as create_tensors,
+        run_contiguous_grouped_ref_and_compare as run_ref_and_compare,
+    )
 
     if not torch.cuda.is_available():
         raise ValueError("CUDA is not available")
@@ -2430,6 +2430,57 @@ def run(
     return exec_time  # Return execution time in microseconds
 
 
+def run_jax(
+    mnkl: tuple[int, int, int, int],
+    scale_granularity_m: int,
+    scale_granularity_k: int,
+    a_dtype: type[cutlass.Numeric],
+    b_dtype: type[cutlass.Numeric],
+    c_dtype: type[cutlass.Numeric],
+    acc_dtype: type[cutlass.Numeric],
+    a_major: str,
+    b_major: str,
+    c_major: str,
+    mma_tiler_mnk: tuple[int, int, int],
+    cluster_shape_mn: tuple[int, int],
+    use_2cta_instrs: bool,
+    tolerance: float,
+    warmup_iterations: int = 0,
+    iterations: int = 1,
+    skip_ref_check: bool = False,
+    uniform_group_sizes: bool = False,
+    use_cold_l2: bool = False,
+    **kwargs,
+) -> float | None:
+    del kwargs
+    from cute.blackwell.kernel.mixed_input_gemm.grouped_mixed_input_gemm_jax_binding import (
+        run_grouped_mixed_input_gemm_jax,
+    )
+
+    return run_grouped_mixed_input_gemm_jax(
+        GroupedMixedInputGemmKernel,
+        mnkl,
+        scale_granularity_m,
+        scale_granularity_k,
+        a_dtype,
+        b_dtype,
+        c_dtype,
+        acc_dtype,
+        a_major,
+        b_major,
+        c_major,
+        mma_tiler_mnk,
+        cluster_shape_mn,
+        use_2cta_instrs,
+        tolerance,
+        skip_ref_check=skip_ref_check,
+        uniform_group_sizes=uniform_group_sizes,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+        use_cold_l2=use_cold_l2,
+    )
+
+
 if __name__ == "__main__":
 
     def parse_comma_separated_ints(s: str) -> tuple[int, ...]:
@@ -2502,8 +2553,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--uniform_group_sizes", action="store_true", help="Use uniform group sizes"
     )
+    parser.add_argument(
+        "--jax",
+        action="store_true",
+        help="Run once through the JAX cutlass_call API instead of the native runner",
+    )
     args = parser.parse_args()
-    run(
+    runner = run_jax if args.jax else run
+    runner(
         args.mnkl,
         args.scale_granularity_m,
         args.scale_granularity_k,
